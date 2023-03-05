@@ -892,17 +892,17 @@ class SimplePositionEncoding(nn.Module):
 
 
 class NormDropout(nn.Module):
-    def __init__(self, input_size, p=0.5):
+    def __init__(self, channels, p=1.):
         super(NormDropout, self).__init__()
         self.p = p
-        self.norm1 = nn.LayerNorm(input_size, elementwise_affine=False)
-        self.norm2 = nn.LayerNorm(input_size)
+        self.norm1 = nn.BatchNorm2d(channels)
+        self.norm2 = nn.BatchNorm2d(channels)
 
     def forward(self, x):
         v = self.norm1(x)
         if not self.training:
             x = self.p * self.norm2(x) + (1 - self.p) * x
-        elif torch.rand() < self.p:
+        elif torch.rand(1) < self.p:
             x = self.norm2(x)
         return x, v
 
@@ -917,26 +917,60 @@ class ResNetLayer(nn.Module):
         if kernel_size[1] % 2 == 0:
             kernel_size[1] -= 1
         layer = [
+            # nn.BatchNorm2d(channels[0]),
+            # nn.ReLU(),
+            # SimplePositionEncoding(input_size[1]),
+            nn.BatchNorm2d(channels[1]),
             nn.ReLU(),
-            SimplePositionEncoding(input_size[1]),
             nn.Conv2d(channels[0], channels[1], kernel_size, padding=(kernel_size[0] // 2, kernel_size[1] // 2)),
-            nn.LayerNorm(input_size, elementwise_affine=False),
+            nn.BatchNorm2d(channels[1]),
             nn.ReLU(),
             nn.Conv2d(channels[1], channels[0], kernel_size, padding=(kernel_size[0] // 2, kernel_size[1] // 2)),
+            # nn.BatchNorm2d(channels[1])
         ]
-        self.norm = NormDropout(input_size)
+        self.norm = nn.BatchNorm2d(channels[1])
         self.layer = nn.Sequential(*layer)
         # self.residual = Residual(0.5, random_method='constant', balanced_residual=True, requires_grad=True)
         # self.dropout = nn.Dropout()
 
     def forward(self, x):
-        x, v = self.norm(x)
-        v = self.layer(v)
+        # x, v = self.norm(x)
+        v = self.layer(x)
         return x + v
 
 
+class BatchScaler(nn.Module):
+    def __init__(self, norm_dims, eps=1e-6, affine_dims=None, affine_features=None, affine_ndim=None, after_relu=False):
+        super(BatchScaler, self).__init__()
+        self.norm_dims = norm_dims
+        self.eps = eps
+        self.after_relu = after_relu
+        assert (affine_dims is None and affine_features is None) or (
+                    affine_dims is not None and affine_features is not None and len(affine_dims) == len(
+                affine_features)), "Wrong Affine dims!"
+        if affine_dims is not None:
+            if affine_ndim is None:
+                affine_ndim = max(affine_dims) + 1
+            affine_shape = torch.ones(affine_ndim, dtype=torch.int64)
+            affine_shape[affine_dims] = affine_features
+            self.alpha = nn.Parameter(torch.ones(affine_shape))
+            self.beta = nn.Parameter(torch.zeros(affine_shape))
+        else:
+            self.register_parameter('alpha', None)
+            self.register_parameter('beta', None)
+
+    def forward(self, x):
+        x_max = x.max(self.norm_dims, keepdim=True)
+        x_min = 0. if self.after_relu else x.min(self.norm_dims, keepdim=True)
+        x_norm = (x - x_min + self.eps) / (x_max - x_min + self.eps)
+        if self.alpha is not None:
+            x_norm *= self.alpha
+            x_norm += self.beta
+        return x_norm
+
+
 class DepthwiseLinear(nn.Module):
-    def __init__(self, channels, in_features, out_features, bias=True, xavier_init=True, right_product=True):
+    def __init__(self, channels, in_features, out_features, bias=False, right_product=True, other_features=None):
         super(DepthwiseLinear, self).__init__()
         self.right_product = right_product
         self.weight = nn.Parameter(torch.empty(channels, in_features, out_features))
@@ -949,10 +983,12 @@ class DepthwiseLinear(nn.Module):
                 nn.init.uniform_(self.bias, -1 / sqrt(out_features), 1 / sqrt(out_features))
         else:
             self.register_parameter('bias', None)
-        if xavier_init:
-            nn.init.xavier_uniform_(self.weight)
+        if other_features is not None:
+            self.weight = nn.Parameter(12 * sqrt(3 / (in_features * out_features * other_features)) * (
+                        2 * torch.rand(channels, in_features, out_features) - 1))
         else:
-            nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+            self.weight = nn.Parameter(torch.empty(channels, in_features, out_features))
+            nn.init.xavier_uniform_(self.weight)
 
     def forward(self, x):
         if self.right_product:
@@ -964,35 +1000,59 @@ class DepthwiseLinear(nn.Module):
         return x
 
 
+class DepthwiseDualLinear(nn.Module):
+    def __init__(self, channels, in_features, out_features, bias=False, attn_init=True):
+        super(DepthwiseDualLinear, self).__init__()
+        self.left_weight = nn.Parameter(torch.empty(channels, out_features[0], in_features[0]))
+        self.right_weight = nn.Parameter(torch.empty(channels, in_features[1], out_features[1]))
+        if bias:
+            self.left_bias = nn.Parameter(torch.empty(channels, out_features[0], 1))
+            self.right_bias = nn.Parameter(torch.empty(channels, 1, out_features[1]))
+            nn.init.uniform_(self.left_bias, -1 / sqrt(in_features[0]), 1 / sqrt(in_features[0]))
+            nn.init.uniform_(self.right_bias, -1 / sqrt(in_features[1]), 1 / sqrt(in_features[1]))
+        else:
+            self.register_parameter('left_bias', None)
+            self.register_parameter('right_bias', None)
+        if xavier_init:
+            nn.init.xavier_uniform_(self.left_weight)
+            nn.init.xavier_uniform_(self.right_weight)
+        else:
+            nn.init.kaiming_uniform_(self.left_weight, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.right_weight, a=math.sqrt(5))
+
+    def forward(self, x):
+        x = self.left_weight.matmul(x).matmul(self.right_weight)
+        if self.left_bias is not None:
+            x += self.left_bias
+            x += self.right_bias
+        return x
+
+
 class LightAttention(nn.Module):
-    def __init__(self, channels, input_size, value_dim):
+    def __init__(self, channels, input_size, value_size):
         super(LightAttention, self).__init__()
-        self.query = nn.Sequential(
-            DepthwiseLinear(channels, input_size[1], value_dim, bias=False),
-            nn.LayerNorm(input_size),
-            nn.Softmax(2)
-        )
-        self.key = nn.Sequential(
-            DepthwiseLinear(channels, input_size[1], value_dim, bias=False),
-            nn.LayerNorm(input_size),
-            nn.Softmax(2)
-        )
-        self.value1 = DepthwiseLinear(channels, input_size[1], value_dim, xavier_init=False)
-        self.value2 = DepthwiseLinear(channels, value_dim, input_size[0], xavier_init=False, right_product=False)
-        self.relu = nn.ReLU()
-        self.pos_code = SimplePositionEncoding(input_size[0], -2)
-        self.norm = NormDropout(input_size)
+        self.query = DepthwiseLinear(channels, input_size[1], value_size)
+        self.key = DepthwiseDualLinear(channels, input_size, (value_size, value_size))
+        self.value1 = DepthwiseDualLinear(channels, input_size, (value_size, value_size), xavier_init=False)
+        self.value2 = DepthwiseLinear(channels, value_size, input_size[0], xavier_init=False, right_product=False)
+        self.attn_norm = nn.LayerNorm(value_size)
+        self.softmax = nn.Softmax(-1)
+        # self.relu = nn.ReLU()
+        self.norm = nn.BatchNorm2d(channels)
+        # self.pos_code = SimplePositionEncoding(input_size[0], -2)
+        # self.norm = NormDropout(channels)
         # self.residual = Residual(0.5, random_method='constant', balanced_residual=True, requires_grad=True)
         # self.dropout = nn.Dropout()
 
     def forward(self, x):
-        x, v = self.norm(x)
-        v = self.pos_code(self.relu(v))
-        q = self.query(v)
-        k = self.key(v)
-        attn = q.matmul(k.transpose(2, 3))
-        v1 = self.value1(v)
-        v2 = self.value2(v)
+        # x, v = self.norm(x)
+        # v = self.pos_code(self.relu(x))
+        x_norm = self.norm(x)
+        q = self.query(x_norm)
+        k = self.key(x_norm)
+        attn = self.softmax(self.attn_norm(q.matmul(k.transpose(2, 3))))
+        v1 = self.value1(x_norm)
+        v2 = self.value2(x_norm)
         v = v1.matmul(v2)
         return x + attn.matmul(v)
 
