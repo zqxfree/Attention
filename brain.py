@@ -907,55 +907,29 @@ class NormDropout(nn.Module):
         return x, v
 
 
-class ResNetLayer(nn.Module):
-    def __init__(self, channels, kernel_size, input_size):
-        super(ResNetLayer, self).__init__()
-        if '__getitem__' not in dir(kernel_size):
-            kernel_size = [kernel_size] * 2
-        if kernel_size[0] % 2 == 0:
-            kernel_size[0] -= 1
-        if kernel_size[1] % 2 == 0:
-            kernel_size[1] -= 1
-        layer = [
-            # nn.BatchNorm2d(channels[0]),
-            # nn.ReLU(),
-            # SimplePositionEncoding(input_size[1]),
-            nn.BatchNorm2d(channels[1]),
-            nn.ReLU(),
-            nn.Conv2d(channels[0], channels[1], kernel_size, padding=(kernel_size[0] // 2, kernel_size[1] // 2)),
-            nn.BatchNorm2d(channels[1]),
-            nn.ReLU(),
-            nn.Conv2d(channels[1], channels[0], kernel_size, padding=(kernel_size[0] // 2, kernel_size[1] // 2)),
-            # nn.BatchNorm2d(channels[1])
-        ]
-        self.norm = nn.BatchNorm2d(channels[1])
-        self.layer = nn.Sequential(*layer)
-        # self.residual = Residual(0.5, random_method='constant', balanced_residual=True, requires_grad=True)
-        # self.dropout = nn.Dropout()
-
-    def forward(self, x):
-        # x, v = self.norm(x)
-        v = self.layer(x)
-        return x + v
-
-
 class BatchMinMaxNorm2d(nn.Module):
-    def __init__(self, channels, eps=1e-6, affine=True):
+    def __init__(self, num_features, eps=1e-06, momentum=0.1, affine=True, track_running_stats=True):
         super(BatchMinMaxNorm2d, self).__init__()
         self.eps = eps
-        self.batch_norm = nn.BatchNorm2d(channels)
+        self.batch_norm = nn.BatchNorm2d(num_features, track_running_stats=True)
         if affine:
-            self.scale = nn.Parameter(torch.ones(channels, 1, 1))
+            self.scale = nn.Parameter(torch.ones(num_features, 1))
         else:
             self.register_parameter('scale', None)
+        self.register_buffer('running_max', torch.zeros(num_features) if track_running_stats else None)
+        self.register_buffer('running_mean', torch.zeros(num_features) if track_running_stats else None)
+        self.register_buffer('num_batches_tracked', torch.tensor(0) if track_running_stats else None)
 
     def forward(self, x):
-        x = self.batch_norm(x)
-        x_max = x.max(1, keepdim=True)
-        x_min = x.min(1, keepdim=True)
+        # x = self.batch_norm(x)
+        shape = x.size()
+        x = x.transpose(0, 1).flatten(1)
+        x_max = x.max(1, keepdim=True)[0]
+        x_min = x.min(1, keepdim=True)[0]
         x_minmax = (x - x_min + self.eps) / (x_max - x_min + self.eps)
         if self.scale is not None:
             x_minmax *= self.scale
+        x_minmax = x_minmax.unflatten(1, (shape[0], shape[2], shape[3])).transpose(0, 1)
         return x_minmax
 
 
@@ -1023,8 +997,79 @@ class DepthwiseDualLinear(nn.Module):
 
 
 class LightAttention(nn.Module):
-    def __init__(self, channels, input_size, value_size):
+    def __init__(self, channels, input_size, value_size, dense_residual_num=8):
         super(LightAttention, self).__init__()
+        self.query = DepthwiseLinear(channels, input_size[1], value_size, other_features=input_size[0])
+        self.key = DepthwiseDualLinear(channels, input_size, value_size)
+        self.value1 = DepthwiseDualLinear(channels, input_size, value_size, attn_init=False)
+        self.value2 = DepthwiseLinear(channels, value_size, input_size[0], right_product=False, other_features=input_size[1])
+        self.attn_norm = nn.LayerNorm(value_size)
+        self.softmax = nn.Softmax(-1)
+        self.norm = BatchMinMaxNorm2d(channels)
+        self.dense_residual_num = dense_residual_num
+        res_conv_kernels = torch.rand(dense_residual_num)
+        self.res_conv = nn.Parameter(res_conv_kernels / res_conv_kernels.sum())
+
+    def forward(self, x):
+        if isinstance(x, tuple):
+            x, x_res = x
+        else:
+            x_res = None
+        q = self.query(x)
+        k = self.key(x)
+        attn = self.softmax(q.matmul(k.transpose(2, 3)))
+        v1 = self.value1(x)
+        v2 = self.value2(x)
+        v = v1.matmul(v2)
+        v = self.norm(attn.matmul(v))
+        if x_res is None:
+            return v, v.unsqueeze(-1)
+        if x_res.size(-1) < self.dense_residual_num:
+            res_conv = self.res_conv[:x_res.size(-1) + 1]
+        else:
+            x_res = x_res[:, :, :, :, 1:]
+            res_conv = self.res_conv
+        x_res = torch.cat([v.unsqueeze(-1), x_res], -1)
+        return x_res.matmul(res_conv), x_res
+
+
+class DenseResidual(nn.Module):
+    def __init__(self, channels, seq_len, kernel_size, dense_residual_num=8, last=False):
+        super(DenseResidual, self).__init__()
+        if '__getitem__' not in dir(kernel_size):
+            kernel_size = [kernel_size] * 2
+        if kernel_size[0] % 2 == 0:
+            kernel_size[0] -= 1
+        if kernel_size[1] % 2 == 0:
+            kernel_size[1] -= 1
+        self.dense_residual_num = dense_residual_num
+        self.norm = BatchMinMaxNorm2d(seq_len) if not last else None
+        self.conv_layer = nn.Sequential(
+            nn.Conv2d(channels[0], channels[1], kernel_size, padding=(kernel_size[0] // 2, kernel_size[1] // 2)),
+            nn.ReLU()
+        )
+        res_conv_kernels = torch.rand(dense_residual_num)
+        self.res_conv = nn.Parameter(res_conv_kernels / res_conv_kernels.sum())
+
+    def forward(self, x):
+        x, x_res = x
+        v = self.conv_layer(x)
+        if self.norm is not None:
+            v = self.norm(v.transpsoe(1, 2)).transpsoe(1, 2)
+        if x_res is None:
+            return v, v.unsqueeze(-1)
+        if x_res.size(-1) < self.dense_residual_num:
+            res_conv = self.res_conv[:x_res.size(-1) + 1]
+        else:
+            x_res = x_res[:, :, :, :, 1:]
+            res_conv = self.res_conv
+        x_res = torch.cat([v.unsqueeze(-1), x_res], -1)
+        return x_res.matmul(res_conv), x_res
+
+
+class LightTransformerBlock(nn.Module):
+    def __init__(self, channels, input_size, value_size):
+        super(LightTransformerBlock, self).__init__()
         self.query = DepthwiseLinear(channels, input_size[1], value_size, other_features=input_size[0])
         self.key = DepthwiseDualLinear(channels, input_size, value_size)
         self.value1 = DepthwiseDualLinear(channels, input_size, value_size, attn_init=False)
@@ -1041,7 +1086,6 @@ class LightAttention(nn.Module):
         v2 = self.value2(x)
         v = v1.matmul(v2)
         return self.norm(x + attn.matmul(v))
-
 
 from torch.utils.data import TensorDataset, DataLoader
 

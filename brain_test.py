@@ -40,23 +40,23 @@ transform_test = transforms.Compose([
 ])
 
 # MNIST dataset
-# train_dataset = torchvision.datasets.MNIST(root=r'E:/PycharmProjects/dataset',
-#                                            train=True,
-#                                            transform=transforms.ToTensor(),
-#                                            download=False)
-#
-# test_dataset = torchvision.datasets.MNIST(root='E:/PycharmProjects/dataset',
-#                                           train=False,
-#                                           transform=transforms.ToTensor(),
-#                                           download=False)
-train_dataset = torchvision.datasets.CIFAR10(root=r'E:/PycharmProjects/dataset',
-                                             train=True,
-                                             transform=transforms.ToTensor(), # cifar10_transform,
-                                             download=False)
+train_dataset = torchvision.datasets.MNIST(root=r'E:/PycharmProjects/dataset',
+                                           train=True,
+                                           transform=transforms.ToTensor(),
+                                           download=False)
 
-test_dataset = torchvision.datasets.CIFAR10(root=r'E:/PycharmProjects/dataset',
-                                            train=False,
-                                            transform=transforms.ToTensor())
+test_dataset = torchvision.datasets.MNIST(root='E:/PycharmProjects/dataset',
+                                          train=False,
+                                          transform=transforms.ToTensor(),
+                                          download=False)
+# train_dataset = torchvision.datasets.CIFAR10(root=r'E:/PycharmProjects/dataset',
+#                                              train=True,
+#                                              transform=transforms.ToTensor(), # cifar10_transform,
+#                                              download=False)
+#
+# test_dataset = torchvision.datasets.CIFAR10(root=r'E:/PycharmProjects/dataset',
+#                                             train=False,
+#                                             transform=transforms.ToTensor())
 # Data loader
 train_loader = torch.utils.data.DataLoader(dataset=train_dataset,
                                            batch_size=batch_size,
@@ -278,25 +278,40 @@ class FirstConv(nn.Module):
 
 size = 16
 
-model4 = nn.Sequential(
-    # nn.Unfold(7, stride=3),
-    # Transpose(1, 2),
-    # SequenceEncoding(64, 49, need_grad=False),
-    # Unsqueeze(1),
-    nn.Conv2d(3, 32, 3, padding=1),
-    nn.ReLU6(),
+# model4 = nn.Sequential(
+#     # nn.Unfold(7, stride=3),
+#     # Transpose(1, 2),
+#     # SequenceEncoding(64, 49, need_grad=False),
+#     # Unsqueeze(1),
+#     nn.Conv2d(3, 32, 3, padding=1),
+#     nn.ReLU6(),
+#     nn.MaxPool2d(2),
+#     LightAttention(32, (16, 16), 8),
+#     ResNetLayer((32, 32), 3, (16, 16)),
+#     LightAttention(32, (16, 16), 8),
+#     ResNetLayer((32, 32), 3, (16, 16)),
+#     nn.MaxPool2d(2),
+#     nn.Flatten(1),
+#     nn.Linear(32 * (size // 2) * (size // 2), 10)
+# )
+
+model5 = nn.Sequential(
+    nn.Conv2d(1, 16, 3, padding=1),
+    nn.ReLU(),
     nn.MaxPool2d(2),
-    LightAttention(32, (16, 16), 8),
-    ResNetLayer((32, 32), 3, (16, 16)),
-    LightAttention(32, (16, 16), 8),
-    ResNetLayer((32, 32), 3, (16, 16)),
+    BatchMinMaxNorm2d(16),
+    nn.Conv2d(16, 32, 3, padding=1),
+    nn.ReLU(),
+    BatchMinMaxNorm2d(32),
     nn.MaxPool2d(2),
+    nn.Conv2d(32, 64, 3, padding=1),
+    nn.ReLU(),
     nn.Flatten(1),
-    nn.Linear(32 * (size // 2) * (size // 2), 10)
+    nn.Linear(64 * 7 * 7, 10)
 )
 
 criterion = nn.CrossEntropyLoss()
-a = protolearn(model4, train_loader, test_loader, criterion, lr=0.001, num_epochs=100, thres_train_accuracy=1,
+a = protolearn(model5, train_loader, test_loader, criterion, lr=0.001, num_epochs=100, thres_train_accuracy=1,
                thres_test_accuracy=1.,
                train_over_thres=5, test_over_thres=0,num_classes=10, image_patch_kernels=None, validate_test_split=0.,
                move_data_device=True, device=None)
