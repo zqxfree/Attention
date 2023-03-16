@@ -11,7 +11,6 @@ from brain import *
 import torchvision
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
-import torchvision.transforms as transforms
 
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -40,23 +39,23 @@ transform_test = transforms.Compose([
 ])
 
 # MNIST dataset
-train_dataset = torchvision.datasets.MNIST(root=r'E:/PycharmProjects/dataset',
-                                           train=True,
-                                           transform=transforms.ToTensor(),
-                                           download=False)
-
-test_dataset = torchvision.datasets.MNIST(root='E:/PycharmProjects/dataset',
-                                          train=False,
-                                          transform=transforms.ToTensor(),
-                                          download=False)
-# train_dataset = torchvision.datasets.CIFAR10(root=r'E:/PycharmProjects/dataset',
-#                                              train=True,
-#                                              transform=transforms.ToTensor(), # cifar10_transform,
-#                                              download=False)
+# train_dataset = torchvision.datasets.MNIST(root=r'D:/PycharmProjects/dataset',
+#                                            train=True,
+#                                            transform=transforms.ToTensor(),
+#                                            download=False)
 #
-# test_dataset = torchvision.datasets.CIFAR10(root=r'E:/PycharmProjects/dataset',
-#                                             train=False,
-#                                             transform=transforms.ToTensor())
+# test_dataset = torchvision.datasets.MNIST(root='D:/PycharmProjects/dataset',
+#                                           train=False,
+#                                           transform=transforms.ToTensor(),
+#                                           download=False)
+train_dataset = torchvision.datasets.CIFAR10(root=r'D:/PycharmProjects/dataset',
+                                             train=True,
+                                             transform=transforms.ToTensor(), # cifar10_transform,
+                                             download=False)
+
+test_dataset = torchvision.datasets.CIFAR10(root=r'D:/PycharmProjects/dataset',
+                                            train=False,
+                                            transform=transforms.ToTensor())
 # Data loader
 train_loader = torch.utils.data.DataLoader(dataset=train_dataset,
                                            batch_size=batch_size,
@@ -236,14 +235,14 @@ model3 = nn.Sequential(
     # SequenceEncoding(32, 32, need_grad=False),
     # Transpose(1, 2),
     # Unsqueeze(1),
-    SplitConv(3, 16, 3),
-    SplitConv(16, 32, 3),
-    SplitConv(32, 64, 3),
-    SplitConv(64, 128, 3),
+    SplitConv(3, 16, 32),
+    SplitConv(16, 32, 32),
+    SplitConv(32, 64, 32),
+    SplitConv(64, 128, 32),
     PMAXPool2d(p=0.9),
-    SplitConv(128, 128, 3),
-    SplitConv(128, 128, 3),
-    SplitConv(128, 128, 3),
+    SplitConv(128, 128, 16),
+    SplitConv(128, 128, 16),
+    SplitConv(128, 128, 16),
     PMAXPool2d(p=0.9),
     nn.Flatten(1),
     nn.Linear(128 * 8 * 8, 10)
@@ -277,44 +276,58 @@ class FirstConv(nn.Module):
         return self.layer(x[0]), x[1]
 
 size = 16
+image_size1 = (49, 64)
+image_size2 = (32, 32)
 
-# model4 = nn.Sequential(
-#     # nn.Unfold(7, stride=3),
-#     # Transpose(1, 2),
-#     # SequenceEncoding(64, 49, need_grad=False),
-#     # Unsqueeze(1),
-#     nn.Conv2d(3, 32, 3, padding=1),
-#     nn.ReLU6(),
-#     nn.MaxPool2d(2),
-#     LightAttention(32, (16, 16), 8),
-#     ResNetLayer((32, 32), 3, (16, 16)),
-#     LightAttention(32, (16, 16), 8),
-#     ResNetLayer((32, 32), 3, (16, 16)),
-#     nn.MaxPool2d(2),
-#     nn.Flatten(1),
-#     nn.Linear(32 * (size // 2) * (size // 2), 10)
-# )
+
+
+model4 = nn.Sequential(
+    nn.Unfold(8, stride=4),
+    nn.Unflatten(1, (3, -1)),
+    Transpose(2, 3),
+    # SequenceEncoding(64, 49, need_grad=False),
+    # Unsqueeze(1),
+    # BatchMinMaxNorm2d(3),
+    # nn.Conv2d(3, 8, 3, padding=1),
+    # nn.ReLU6(),
+    nn.Flatten(0, 1),
+    LightAttention(image_size1),
+    DenseResidual(64),
+    LightAttention(image_size1),
+    DenseResidual(64),
+    LightAttention(image_size1),
+    DenseResidual(64),
+    nn.Unflatten(0, (-1, 3)),
+    # DenseResidual(32, 3),
+    # LightAttention(32, image_size1, 32),
+    # DenseResidual(32, image_size2, 3),
+    nn.Flatten(1),
+    nn.Linear(3 * 49 * 64, 10)
+)
 
 model5 = nn.Sequential(
-    nn.Conv2d(1, 16, 3, padding=1),
-    nn.ReLU(),
-    nn.MaxPool2d(2),
-    BatchMinMaxNorm2d(16),
+    nn.Conv2d(3, 16, 3, padding=1),
+    nn.ReLU6(),
+    LayerMinMaxNorm2d((32, 32)),
     nn.Conv2d(16, 32, 3, padding=1),
-    nn.ReLU(),
-    BatchMinMaxNorm2d(32),
+    nn.ReLU6(),
     nn.MaxPool2d(2),
+    LayerMinMaxNorm2d((16, 16)),
     nn.Conv2d(32, 64, 3, padding=1),
-    nn.ReLU(),
+    nn.ReLU6(),
+    nn.MaxPool2d(2),
+    LayerMinMaxNorm2d((8, 8)),
+    nn.Conv2d(64, 64, 3, padding=1),
+    nn.ReLU6(),
     nn.Flatten(1),
-    nn.Linear(64 * 7 * 7, 10)
+    nn.Linear(64 * 8 * 8, 10)
 )
 
 criterion = nn.CrossEntropyLoss()
 a = protolearn(model5, train_loader, test_loader, criterion, lr=0.001, num_epochs=100, thres_train_accuracy=1,
                thres_test_accuracy=1.,
-               train_over_thres=5, test_over_thres=0,num_classes=10, image_patch_kernels=None, validate_test_split=0.,
-               move_data_device=True, device=None)
+               train_over_thres=8, test_over_thres=0,num_classes=10, image_patch_kernels=None, validate_test_split=0.,
+               move_data_device=True, device=torch.device('cuda:0'))
 print(a[2])
 print(a[3])
 

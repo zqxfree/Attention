@@ -12,6 +12,11 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
 
+class AntiSigmoid(nn.Module):
+    def forward(self, x):
+        return torch.log((x + 0.01) / (1.01 - x))
+
+
 class SoftTanh(nn.Module):
     def __init__(self, tanh=True):
         super(SoftTanh, self).__init__()
@@ -228,7 +233,7 @@ class PMAXPool1d(nn.Module):
 
 
 class PMAXPool2d(nn.Module):
-    def __init__(self, kernel_size=2, p=0.7, print=True):
+    def __init__(self, kernel_size=2, p=0.7):
         super(PMAXPool2d, self).__init__()
         if '__getitem__' not in dir(kernel_size):
             kernel_size = (kernel_size, kernel_size)
@@ -237,26 +242,34 @@ class PMAXPool2d(nn.Module):
         self.p1 = kernel_size[0] * kernel_size[1] * p - self.p0
         self.max_pool = nn.MaxPool2d(kernel_size, return_indices=True)
         self.avg_pool = nn.AvgPool2d(kernel_size)
-        self.pr = print
 
     def forward(self, x):
-        x, printable = x
         y, max_indices = self.max_pool(x)
         y = self.p0 * x + self.p1 * F.max_unpool2d(y, max_indices, self.kernel_size, output_size=x.size())
-        return (self.avg_pool(y), printable) if self.pr else self.avg_pool(y)
+        return self.avg_pool(y)
 
 
 class SplitConv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, dropout=False, residual=True):
+    def __init__(self, in_channels, out_channels, norm_size, kernel_size=3, dropout=False, residual=True):
         super(SplitConv, self).__init__()
+        self.sparse1 = nn.Sequential(
+            BatchMinMaxNorm2d(in_channels),
+            nn.Conv2d(in_channels, in_channels, kernel_size, padding=kernel_size // 2),
+            nn.Softmax(-1)
+        )
+        self.sparse2 = nn.Sequential(
+            BatchMinMaxNorm2d(in_channels),
+            nn.Conv2d(in_channels, in_channels, kernel_size, padding=kernel_size // 2),
+            nn.Softmax(-1)
+        )
         self.conv1 = nn.Sequential(
+            BatchMinMaxNorm2d(in_channels),
             nn.Conv2d(in_channels, out_channels, kernel_size, padding=kernel_size // 2),
-            nn.BatchNorm2d(out_channels),
             nn.ReLU()
         )
         self.conv2 = nn.Sequential(
+            BatchMinMaxNorm2d(in_channels),
             nn.Conv2d(in_channels, out_channels, kernel_size, padding=kernel_size // 2),
-            nn.BatchNorm2d(out_channels),
             nn.Tanh()
         )
         self.dropout = nn.Dropout2d() if dropout else self.register_module('dropout', None)
@@ -266,7 +279,9 @@ class SplitConv(nn.Module):
             self.add_module('residual', None)
 
     def forward(self, x):
-        y = self.conv1(x) * self.conv2(x)
+        x1 = self.sparse1(x) * x
+        x2 = self.sparse2(x) * x
+        y = self.conv1(x1) * self.conv2(x2)
         if self.dropout is not None:
             y = self.dropout(y)
         return y if self.residual is None else self.residual(x, y)
@@ -340,7 +355,7 @@ class AutoLayerNorm(nn.Module):
 
 
 class Residual(nn.Module):
-    def __init__(self, p=1., random_method='constant', dropout=False, balanced_residual=False, requires_grad=False):
+    def __init__(self, p=1., random_method='constant', dropout=False, balanced_residual=True, requires_grad=True):
         super(Residual, self).__init__()
         self.dropout = dropout
         self.balanced_residual = balanced_residual
@@ -908,51 +923,170 @@ class NormDropout(nn.Module):
 
 
 class BatchMinMaxNorm2d(nn.Module):
-    def __init__(self, num_features, eps=1e-06, momentum=0.1, affine=True, track_running_stats=True):
+    def __init__(self, num_features, eps=1e-06, momentum=0.1, approx_rate=0.1, affine=True, track_running_stats=False):
         super(BatchMinMaxNorm2d, self).__init__()
         self.eps = eps
-        self.batch_norm = nn.BatchNorm2d(num_features, track_running_stats=True)
+        self.momentum = momentum
+        self.approx_rate = approx_rate
+        self.register_buffer('running_max', torch.ones(num_features, 1) if track_running_stats else None)
+        self.register_buffer('running_min', torch.zeros(num_features, 1) if track_running_stats else None)
         if affine:
             self.scale = nn.Parameter(torch.ones(num_features, 1))
         else:
             self.register_parameter('scale', None)
-        self.register_buffer('running_max', torch.zeros(num_features) if track_running_stats else None)
-        self.register_buffer('running_mean', torch.zeros(num_features) if track_running_stats else None)
-        self.register_buffer('num_batches_tracked', torch.tensor(0) if track_running_stats else None)
 
     def forward(self, x):
-        # x = self.batch_norm(x)
+        max_min_calc = self.training or self.running_max is None
         shape = x.size()
         x = x.transpose(0, 1).flatten(1)
-        x_max = x.max(1, keepdim=True)[0]
-        x_min = x.min(1, keepdim=True)[0]
-        x_minmax = (x - x_min + self.eps) / (x_max - x_min + self.eps)
+        if max_min_calc:
+            x_max = x.max(1, keepdim=True).values
+            x_min = x.min(1, keepdim=True).values
+            if self.approx_rate is not None:
+                max_indices = x.data >= (1 + (1 - 2 * (x_max.data >= 0)) * self.approx_rate) * x_max.data
+                x_max = torch.where(max_indices, x, 0.).sum(1, keepdim=True) / max_indices.sum(1, keepdim=True)
+                # x_max = torch.where(max_indices, x, inf).min(1, keepdim=True).values
+                min_indices = x.data <= (1 + (2 * (x_min.data >= 0) - 1) * self.approx_rate) * x_min.data
+                x_min = torch.where(min_indices, x, 0.).sum(1, keepdim=True) / min_indices.sum(1, keepdim=True)
+                # x_min = torch.where(min_indices, x, -inf).max(1, keepdim=True).values
+        else:
+            x_max = self.running_max
+            x_min = self.running_min
+        if self.training and self.running_max is not None:
+            self.running_max = (1 - self.momentum) * self.running_max + self.momentum * x_max
+            self.running_min = (1 - self.momentum) * self.running_min + self.momentum * x_min
+        x = (x - x_min) / (x_max - x_min + self.eps)
+        if not (max_min_calc and self.approx_rate is None):
+            x = x.clamp(0., 1.)
         if self.scale is not None:
-            x_minmax *= self.scale
-        x_minmax = x_minmax.unflatten(1, (shape[0], shape[2], shape[3])).transpose(0, 1)
-        return x_minmax
+            x *= self.scale
+        x = x.unflatten(1, (shape[0], shape[2], shape[3])).transpose(0, 1)
+        return x
+
+
+class BatchMaxNorm2d(nn.Module):
+    def __init__(self, num_features, eps=1e-06, momentum=0.1, approx_rate=0.1, affine=True, track_running_stats=False):
+        super(BatchMaxNorm2d, self).__init__()
+        self.eps = eps
+        self.momentum = momentum
+        self.approx_rate = approx_rate
+        self.register_buffer('running_max', torch.ones(num_features, 1) if track_running_stats else None)
+        if affine:
+            self.scale = nn.Parameter(torch.ones(num_features, 1))
+        else:
+            self.register_parameter('scale', None)
+
+    def forward(self, x):
+        max_min_calc = self.training or self.running_max is None
+        shape = x.size()
+        x = x.transpose(0, 1).flatten(1)
+        if max_min_calc:
+            x_max = x.max(1, keepdim=True).values
+            if self.approx_rate is not None:
+                max_indices = x.data >= (1 + (1 - 2 * (x_max.data >= 0)) * self.approx_rate) * x_max.data
+                x_max = torch.where(max_indices, x, 0.).sum(1, keepdim=True) / max_indices.sum(1, keepdim=True)
+                # x_max = torch.where(max_indices, x, inf).min(1, keepdim=True).values
+        else:
+            x_max = self.running_max
+        if self.training and self.running_max is not None:
+            self.running_max = (1 - self.momentum) * self.running_max + self.momentum * x_max
+        x /= x_max + self.eps
+        if not (max_min_calc and self.approx_rate is None):
+            x = x.clamp(0., 1.)
+        if self.scale is not None:
+            x *= self.scale
+        x = x.unflatten(1, (shape[0], shape[2], shape[3])).transpose(0, 1)
+        return x
+
+
+class InstanceMinMaxNorm2d(nn.Module):
+    def __init__(self, num_features, eps=1e-06, affine=True):
+        super(InstanceMinMaxNorm2d, self).__init__()
+        self.eps = eps
+        if affine:
+            self.scale = nn.Parameter(torch.ones(num_features, 1))
+        else:
+            self.register_parameter('scale', None)
+
+    def forward(self, x):
+        width = x.size(-1)
+        x = x.flatten(2)
+        x_min = x.min(2, keepdim=True).values
+        x_max = x.max(2, keepdim=True).values
+        x = (x - x_min) / (x_max - x_min + self.eps)
+        if self.scale is not None:
+            x *= self.scale
+        x = x.unflatten(2, (-1, width))
+        return x
+
+
+class InstanceMaxNorm2d(nn.Module):
+    def __init__(self, num_features, eps=1e-06, affine=True):
+        super(InstanceMaxNorm2d, self).__init__()
+        self.eps = eps
+        if affine:
+            self.scale = nn.Parameter(torch.ones(num_features, 1))
+        else:
+            self.register_parameter('scale', None)
+
+    def forward(self, x):
+        width = x.size(-1)
+        x = x.flatten(2)
+        x_max = x.max(2, keepdim=True).values
+        x = x / (x_max + self.eps)
+        if self.scale is not None:
+            x *= self.scale
+        x = x.unflatten(2, (-1, width))
+        return x
+
+
+class LayerMinMaxNorm2d(nn.Module):
+    def __init__(self, affine_shape, eps=1e-06, affine=True):
+        super(LayerMinMaxNorm2d, self).__init__()
+        self.eps = eps
+        if not isinstance(affine_shape, Iterable):
+            affine_shape = [affine_shape]
+        self.affine_shape = affine_shape
+        if affine:
+            self.alpha = nn.Parameter(torch.ones(affine_shape))
+            self.beta = nn.Parameter(torch.zeros(affine_shape))
+        else:
+            self.register_parameter('alpha', None)
+            self.register_parameter('beta', None)
+        # if sparse:
+        #     self.sparse_thres = nn.Parameter(0.3*torch.rand(affine_shape) + 0.7, requires_grad=False)
+        #     self.relu = nn.ReLU()
+        # else:
+        #     self.register_parameter('sparse_thres', None)
+
+    def forward(self, x):
+        # x = (x - x.mean(list(range(-len(self.affine_shape), 0)), keepdim=True)) / (
+        #             x.std(list(range(-len(self.affine_shape), 0)), keepdim=True) + self.eps)
+        x = x.flatten(-len(self.affine_shape))
+        x_min = x.min(-1, keepdim=True).values
+        x_max = x.max(-1, keepdim=True).values
+        x = (x - x_min) / (x_max - x_min + self.eps)
+        x = x.unflatten(-1, self.affine_shape)
+        # if self.sparse_thres is not None:
+        #     x = self.relu(x - self.sparse_thres)
+        if self.alpha is not None:
+            x = self.alpha * x + self.beta
+        return x
 
 
 class DepthwiseLinear(nn.Module):
-    def __init__(self, channels, in_features, out_features, bias=False, right_product=True, other_features=None):
+    def __init__(self, channels, in_features, out_features, weight_init_size, bias=False, right_product=True):
         super(DepthwiseLinear, self).__init__()
         self.right_product = right_product
-        self.weight = nn.Parameter(torch.empty(channels, in_features, out_features))
+        self.weight = nn.Parameter(
+            sqrt(3 / weight_init_size) * (2 * torch.rand(channels, in_features, out_features) - 1))
         if bias:
             if right_product:
-                self.bias = nn.Parameter(torch.empty(channels, 1, out_features) )
-                nn.init.uniform_(self.bias, -1 / sqrt(in_features), 1 / sqrt(in_features))
+                self.bias = nn.Parameter(torch.zeros(channels, 1, out_features))
             else:
-                self.bias = nn.Parameter(torch.empty(channels, in_features, 1))
-                nn.init.uniform_(self.bias, -1 / sqrt(out_features), 1 / sqrt(out_features))
+                self.bias = nn.Parameter(torch.zeros(channels, in_features, 1))
         else:
             self.register_parameter('bias', None)
-        if other_features is not None:
-            self.weight = nn.Parameter(12 * sqrt(3 / (in_features * out_features * other_features)) * (
-                        2 * torch.rand(channels, in_features, out_features) - 1))
-        else:
-            self.weight = nn.Parameter(torch.empty(channels, in_features, out_features))
-            nn.init.xavier_uniform_(self.weight)
 
     def forward(self, x):
         if self.right_product:
@@ -996,96 +1130,110 @@ class DepthwiseDualLinear(nn.Module):
         return x
 
 
+class View(nn.Module):
+    def forward(self, x):
+        return x.view(-1, 1, x.size(-2), x.size(-1))
+
+
 class LightAttention(nn.Module):
-    def __init__(self, channels, input_size, value_size, dense_residual_num=8):
+    def __init__(self, input_size, num_heads=2, pos_grad=True):
         super(LightAttention, self).__init__()
-        self.query = DepthwiseLinear(channels, input_size[1], value_size, other_features=input_size[0])
-        self.key = DepthwiseDualLinear(channels, input_size, value_size)
-        self.value1 = DepthwiseDualLinear(channels, input_size, value_size, attn_init=False)
-        self.value2 = DepthwiseLinear(channels, value_size, input_size[0], right_product=False, other_features=input_size[1])
-        self.attn_norm = nn.LayerNorm(value_size)
-        self.softmax = nn.Softmax(-1)
-        self.norm = BatchMinMaxNorm2d(channels)
-        self.dense_residual_num = dense_residual_num
-        res_conv_kernels = torch.rand(dense_residual_num)
-        self.res_conv = nn.Parameter(res_conv_kernels / res_conv_kernels.sum())
+        self.seq_len = input_size[0]
+        self.num_heads = num_heads
+        self.seq_range = range(input_size[0])
+        # self.register_buffer('seq_range', torch.arange(1, input_size[0] + 1, dtype=torch.float32).sqrt().unsqueeze(1))
+        value_size = input_size[1] // num_heads
+        self.query = DepthwiseLinear(num_heads, input_size[1], value_size,
+                                     weight_init_size=sqrt(value_size * input_size[1] * input_size[1]))
+        self.key = DepthwiseLinear(num_heads, input_size[1], value_size,
+                                   weight_init_size=sqrt(value_size * input_size[1] * input_size[1]))
+        # self.value = nn.Sequential(
+        #     DepthwiseLinear(num_heads, input_size[1], value_size, weight_init_size=(input_size[1] + value_size) / 2),
+        #     nn.ReLU6(),
+        #     LayerMinMaxNorm2d(value_size),
+        #     DepthwiseLinear(num_heads, value_size, value_size, weight_init_size=value_size)
+        # )
+        self.value = DepthwiseLinear(num_heads, input_size[1], value_size, weight_init_size=(input_size[1] + value_size) / 2)
+        self.fc_norm = LayerMinMaxNorm2d(input_size[1])
+        self.fc = nn.Linear(input_size[1], input_size[1])
+        self.softmax = EpsSoftmax(-1)
+        self.attn_norm = LayerMinMaxNorm2d(input_size[0])  # nn.LayerNorm(input_size[0], elementwise_affine=False)
+        self.norm = LayerMinMaxNorm2d(input_size[1])
+        self.alpha = nn.Parameter(torch.rand(1))
+        # self.pos_weight = nn.Parameter(torch.cos((np.pi / 2 / input_size[0]) * torch.stack(
+        #     [torch.abs(torch.arange(input_size[0]) - i) for i in range(input_size[0])])).repeat(num_heads, 1, 1),
+        #                                requires_grad=pos_grad)
+        image_len = int(sqrt(input_size[0]))
+        self.pos_weight = nn.Parameter(torch.cos((np.pi / 4 / image_len) * torch.stack([torch.flatten(
+            torch.abs(torch.arange(image_len) - i)[:, None] + torch.abs(torch.arange(image_len) - j)) for i in
+                                                                                            range(image_len) for j
+                                                                                            in range(
+                image_len)])).repeat(num_heads, 1, 1), requires_grad=pos_grad)
+        self.register_buffer('mask', torch.full((input_size[0],), -inf).diag())
+        # if image_patch is not None:
+        #     self.unfold = nn.Unfold(image_patch[0], stride=image_patch[1])
+        # else:
+        #     self.unfold = None
 
     def forward(self, x):
-        if isinstance(x, tuple):
-            x, x_res = x
+        # if self.unfold is not None:
+        #     x = self.unfold(x)
+        #     x = x.unflatten(1, (self.channels, -1)).transpose(2, 3)
+        x_norm = self.norm(x).unsqueeze(1)
+        q = self.query(x_norm)
+        k = self.key(x_norm)
+        qk = q.matmul(k.transpose(2, 3))
+        if self.training:
+            mask = torch.rand_like(qk).ge(0.5).type(torch.float32).to(x.device).data  # torch.randint_like(qk, 0, 2).to(x.device).data
+            # attn_mask = torch.where(mask == 1., 0., -inf)
+            qk = qk.abs()
+            qk *= mask
+            qk = qk / (qk.sum(-1, keepdim=True) + 1e-6)
+            # qk = self.softmax(self.attn_norm(qk) + attn_mask)
         else:
-            x_res = None
-        q = self.query(x)
-        k = self.key(x)
-        attn = self.softmax(q.matmul(k.transpose(2, 3)))
-        v1 = self.value1(x)
-        v2 = self.value2(x)
-        v = v1.matmul(v2)
-        v = self.norm(attn.matmul(v))
-        if x_res is None:
-            return v, v.unsqueeze(-1)
-        if x_res.size(-1) < self.dense_residual_num:
-            res_conv = self.res_conv[:x_res.size(-1) + 1]
-        else:
-            x_res = x_res[:, :, :, :, 1:]
-            res_conv = self.res_conv
-        x_res = torch.cat([v.unsqueeze(-1), x_res], -1)
-        return x_res.matmul(res_conv), x_res
+            # qk = self.softmax(self.attn_norm(qk))
+            qk = qk.abs()
+            qk = qk / (qk.sum(-1, keepdim=True) + 1e-6)
+        attn = qk * self.pos_weight
+        v = self.value(x_norm)
+        attn = attn.matmul(v)
+        attn = attn.transpose(1, 2).flatten(2)
+        attn = self.fc(attn)
+        return x + attn  # (1 - self.alpha) * x + self.alpha * attn
 
 
 class DenseResidual(nn.Module):
-    def __init__(self, channels, seq_len, kernel_size, dense_residual_num=8, last=False):
+    def __init__(self, num_features, recovered_channels=None):
         super(DenseResidual, self).__init__()
-        if '__getitem__' not in dir(kernel_size):
-            kernel_size = [kernel_size] * 2
-        if kernel_size[0] % 2 == 0:
-            kernel_size[0] -= 1
-        if kernel_size[1] % 2 == 0:
-            kernel_size[1] -= 1
-        self.dense_residual_num = dense_residual_num
-        self.norm = BatchMinMaxNorm2d(seq_len) if not last else None
-        self.conv_layer = nn.Sequential(
-            nn.Conv2d(channels[0], channels[1], kernel_size, padding=(kernel_size[0] // 2, kernel_size[1] // 2)),
-            nn.ReLU()
+        # if '__getitem__' not in dir(kernel_size):
+        #     kernel_size = [kernel_size] * 2
+        # if kernel_size[0] % 2 == 0:
+        #     kernel_size[0] -= 1
+        # if kernel_size[1] % 2 == 0:
+        #     kernel_size[1] -= 1
+        self.recovered_channels = recovered_channels
+        self.mlp = nn.Sequential(
+            LayerMinMaxNorm2d(num_features),
+            nn.Linear(num_features, num_features),
+            nn.ReLU6(),
+            nn.Linear(num_features, num_features)
         )
-        res_conv_kernels = torch.rand(dense_residual_num)
-        self.res_conv = nn.Parameter(res_conv_kernels / res_conv_kernels.sum())
+        self.alpha = nn.Parameter(torch.rand(1))
+        # if image_patch is not None:
+        #     self.fold = nn.Fold(input_size, kernel_size=image_patch[0], stride=image_patch[1])
+        # else:
+        #     self.fold = None
 
     def forward(self, x):
-        x, x_res = x
-        v = self.conv_layer(x)
-        if self.norm is not None:
-            v = self.norm(v.transpsoe(1, 2)).transpsoe(1, 2)
-        if x_res is None:
-            return v, v.unsqueeze(-1)
-        if x_res.size(-1) < self.dense_residual_num:
-            res_conv = self.res_conv[:x_res.size(-1) + 1]
-        else:
-            x_res = x_res[:, :, :, :, 1:]
-            res_conv = self.res_conv
-        x_res = torch.cat([v.unsqueeze(-1), x_res], -1)
-        return x_res.matmul(res_conv), x_res
+        # if self.fold is not None:
+        #     x = x.transpose(2, 3).flatten(1, 2)
+        #     x = self.fold(x)
+        v = self.mlp(x)
+        v += x # (1 - self.alpha) * x + self.alpha * v
+        if self.recovered_channels is not None:
+            v = v.view(-1, self.recovered_channels, v.size(-2), v.size(-1))
+        return v
 
-
-class LightTransformerBlock(nn.Module):
-    def __init__(self, channels, input_size, value_size):
-        super(LightTransformerBlock, self).__init__()
-        self.query = DepthwiseLinear(channels, input_size[1], value_size, other_features=input_size[0])
-        self.key = DepthwiseDualLinear(channels, input_size, value_size)
-        self.value1 = DepthwiseDualLinear(channels, input_size, value_size, attn_init=False)
-        self.value2 = DepthwiseLinear(channels, value_size, input_size[0], right_product=False, other_features=input_size[1])
-        self.attn_norm = nn.LayerNorm(value_size)
-        self.softmax = nn.Softmax(-1)
-        self.norm = BatchScaler([0, 2, 3], affine_dims=0, affine_features=channels, affine_ndim=3)
-
-    def forward(self, x):
-        q = self.query(x)
-        k = self.key(x)
-        attn = self.softmax(q.matmul(k.transpose(2, 3)))
-        v1 = self.value1(x)
-        v2 = self.value2(x)
-        v = v1.matmul(v2)
-        return self.norm(x + attn.matmul(v))
 
 from torch.utils.data import TensorDataset, DataLoader
 
